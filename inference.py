@@ -11,6 +11,7 @@ Usage:
     python inference.py                                    # Webcam
     python inference.py --source video.mp4                 # Video file
     python inference.py --source 0 --checkpoint best.pth   # Webcam + custom model
+    python inference.py --demo                             # No trained model needed
 """
 
 import os
@@ -39,15 +40,16 @@ from utils.loitering_detector import LoiteringDetector
 # ══════════════════════════════════════════════════════════════════════
 
 ALERT_CONFIG = {
-    "normal":               {"color": (0, 200, 0),   "severity": 0, "label": "Normal"},
-    "vandalism":            {"color": (0, 0, 255),    "severity": 3, "label": "⚠ VANDALISM"},
-    "harassment":           {"color": (0, 100, 255),  "severity": 3, "label": "⚠ HARASSMENT"},
-    "fighting":             {"color": (0, 0, 255),    "severity": 4, "label": "🚨 FIGHTING"},
-    "dangerous_object":     {"color": (0, 50, 255),   "severity": 3, "label": "⚠ DANGEROUS OBJECT"},
-    "faint":                {"color": (255, 0, 255),  "severity": 4, "label": "🚨 PERSON DOWN"},
-    "suspicious_gathering": {"color": (0, 165, 255),  "severity": 2, "label": "⚠ SUSPICIOUS GATHERING"},
-    "loitering":            {"color": (0, 255, 255),  "severity": 1, "label": "⚠ LOITERING"},
+    "normal":     {"color": (0, 200, 0),   "severity": 0, "label": "Normal"},
+    "fight":      {"color": (0, 0, 255),   "severity": 4, "label": "🚨 FIGHTING"},
+    "fighting":   {"color": (0, 0, 255),   "severity": 4, "label": "🚨 FIGHTING"},
+    "vandalism":  {"color": (0, 50, 255),  "severity": 3, "label": "⚠ VANDALISM"},
+    "faint":      {"color": (255, 0, 255), "severity": 4, "label": "🚨 PERSON DOWN"},
+    "loitering":  {"color": (0, 255, 255), "severity": 1, "label": "⚠ LOITERING"},
 }
+
+# Default entry for unknown classes
+_DEFAULT_ALERT = {"color": (0, 165, 255), "severity": 2, "label": "⚠ ALERT"}
 
 
 class SecurityInferencePipeline:
@@ -102,9 +104,8 @@ class SecurityInferencePipeline:
         )
 
         # ── Frame buffer for action recognition ──
-        # We accumulate frames and run action recognition every N frames
         self.frame_buffer = deque(maxlen=64)
-        self.clip_interval_frames = 15   # Run action recognition every 15 frames
+        self.clip_interval_frames = 15
         self.frame_count = 0
 
         # ── Current predictions ──
@@ -112,7 +113,7 @@ class SecurityInferencePipeline:
         self.current_confidence = 0.0
         self.alert_history = deque(maxlen=100)
 
-        print(f"✓ Pipeline initialized (device={self.device})")
+        print(f"✓ Pipeline initialized (device={self.device}, classes={ACTION_CLASSES})")
 
     def detect_persons(self, frame: np.ndarray) -> list:
         """Run YOLOv8 person detection. Returns list of [x1,y1,x2,y2,conf]."""
@@ -138,7 +139,6 @@ class SecurityInferencePipeline:
         if self.tracker is None or not detections:
             return []
 
-        # DeepSORT expects detections as [[x1,y1,w,h], conf, class]
         dsort_dets = []
         for det in detections:
             x1, y1, x2, y2, conf = det
@@ -164,7 +164,7 @@ class SecurityInferencePipeline:
         # Build clip from buffer
         frames_list = list(self.frame_buffer)
         indices = np.linspace(0, len(frames_list) - 1, 64, dtype=np.int64)
-        clip_frames = np.stack([frames_list[i] for i in indices])  # (64, H, W, 3)
+        clip_frames = np.stack([frames_list[i] for i in indices])
 
         # Convert BGR → RGB
         clip_frames = clip_frames[:, :, :, ::-1].copy()
@@ -177,20 +177,17 @@ class SecurityInferencePipeline:
             crop_size=self.cfg.crop_size,
         )
 
-        # Add batch dimension
         slow_tensor = slow_tensor.unsqueeze(0).to(self.device)
         fast_tensor = fast_tensor.unsqueeze(0).to(self.device)
 
-        # Inference
         with torch.no_grad():
             logits = self.action_model([slow_tensor, fast_tensor])
             probs = torch.softmax(logits, dim=1)
             conf, pred_idx = probs.max(dim=1)
 
-        action_label = IDX_TO_CLASS[pred_idx.item()]
+        action_label = IDX_TO_CLASS.get(pred_idx.item(), f"class_{pred_idx.item()}")
         confidence = conf.item()
 
-        # Only update if confidence exceeds threshold
         if confidence >= self.cfg.confidence_threshold:
             self.current_action = action_label
             self.current_confidence = confidence
@@ -232,16 +229,14 @@ class SecurityInferencePipeline:
         overlay = self.loitering_detector.draw_overlay(overlay)
 
         # ── Action recognition status bar ──
-        alert_cfg = ALERT_CONFIG.get(action, ALERT_CONFIG["normal"])
+        alert_cfg = ALERT_CONFIG.get(action, _DEFAULT_ALERT)
         bar_color = alert_cfg["color"]
         label = alert_cfg["label"]
 
-        # Top status bar
         cv2.rectangle(overlay, (0, 0), (w, 60), (30, 30, 30), -1)
         cv2.putText(overlay, f"{label} ({confidence:.0%})", (15, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, bar_color, 2)
 
-        # Severity indicator
         severity = alert_cfg["severity"]
         for i in range(5):
             color = bar_color if i < severity else (80, 80, 80)
@@ -272,7 +267,6 @@ class SecurityInferencePipeline:
         Args:
             source: Camera index (int), video file path (str), or RTSP URL.
         """
-        # Open video source
         if isinstance(source, str) and source.isdigit():
             source = int(source)
         cap = cv2.VideoCapture(source)
@@ -287,7 +281,8 @@ class SecurityInferencePipeline:
         print(f"\n{'='*60}")
         print(f"  Security Monitoring Active")
         print(f"  Source: {source}")
-        print(f"  Press 'q' to quit | 'z' to set zone | 's' to screenshot")
+        print(f"  Classes: {ACTION_CLASSES}")
+        print(f"  Press 'q' to quit | 's' to screenshot")
         print(f"{'='*60}\n")
 
         fps_counter = deque(maxlen=30)
@@ -298,22 +293,13 @@ class SecurityInferencePipeline:
             if not ret:
                 break
 
-            # 1. Person detection
             detections = self.detect_persons(frame)
-
-            # 2. Person tracking
             tracks = self.track_persons(detections, frame)
-
-            # 3. Loitering detection (tracking-based)
             loiter_alerts = self.loitering_detector.update(tracks, frame)
-
-            # 4. Action recognition (SlowFast, periodic)
             action, confidence = self.recognize_action(frame)
 
-            # 5. Draw HUD
             display_frame = self.draw_hud(frame, action, confidence, tracks, loiter_alerts)
 
-            # FPS
             fps_counter.append(time.time() - t_start)
             fps = len(fps_counter) / sum(fps_counter) if fps_counter else 0
             cv2.putText(display_frame, f"FPS: {fps:.1f}",
@@ -322,7 +308,6 @@ class SecurityInferencePipeline:
 
             cv2.imshow("Security Monitor", display_frame)
 
-            # Handle keyboard
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
@@ -344,7 +329,6 @@ class DemoPipeline:
     """
     Simplified pipeline for testing WITHOUT a trained SlowFast model.
     Only does person detection, tracking, and loitering detection.
-    Useful for verifying your setup before training.
     """
 
     def __init__(self):
@@ -353,7 +337,7 @@ class DemoPipeline:
 
         self.yolo = YOLO("yolov8n.pt")
         self.tracker = DeepSort(max_age=30, n_init=3)
-        self.loitering = LoiteringDetector(time_threshold=30.0)  # 30s for demo
+        self.loitering = LoiteringDetector(time_threshold=30.0)
 
     def run(self, source=0):
         cap = cv2.VideoCapture(source)
@@ -365,7 +349,6 @@ class DemoPipeline:
             if not ret:
                 break
 
-            # Detect
             results = self.yolo(frame, classes=[0], conf=0.5, verbose=False)
             dets = []
             for r in results:
@@ -375,14 +358,11 @@ class DemoPipeline:
                     w, h = x2 - x1, y2 - y1
                     dets.append(([x1, y1, w, h], conf, "person"))
 
-            # Track
             tracks = self.tracker.update_tracks(dets, frame=frame)
             confirmed = [t for t in tracks if t.is_confirmed()]
 
-            # Loitering
             alerts = self.loitering.update(confirmed, frame)
 
-            # Draw
             frame = self.loitering.draw_overlay(frame)
             for t in confirmed:
                 ltrb = t.to_ltrb()

@@ -4,7 +4,6 @@ checkpoint management, and early stopping.
 """
 
 import os
-import json
 import numpy as np
 import torch
 import matplotlib
@@ -15,7 +14,6 @@ from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
     confusion_matrix,
-    classification_report,
 )
 from typing import Dict, List, Optional
 
@@ -29,9 +27,12 @@ from configs.config import ACTION_CLASSES, NUM_CLASSES
 def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    class_names: List[str] = ACTION_CLASSES,
+    class_names: List[str] = None,
 ) -> Dict:
     """Compute accuracy, per-class precision/recall/F1, and macro averages."""
+    if class_names is None:
+        class_names = ACTION_CLASSES
+
     acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred, labels=list(range(len(class_names))),
@@ -81,16 +82,19 @@ def print_metrics(metrics: Dict, epoch: Optional[int] = None):
 def plot_confusion_matrix(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    class_names: List[str] = ACTION_CLASSES,
+    class_names: List[str] = None,
     save_path: str = "confusion_matrix.png",
     normalize: bool = True,
 ):
     """Plot and save a confusion matrix."""
+    if class_names is None:
+        class_names = ACTION_CLASSES
+
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
     if normalize:
         cm = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(max(8, len(class_names) * 1.5), max(6, len(class_names) * 1.2)))
     sns.heatmap(
         cm, annot=True, fmt=".2f" if normalize else "d",
         xticklabels=class_names, yticklabels=class_names,

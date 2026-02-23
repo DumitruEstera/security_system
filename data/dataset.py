@@ -1,37 +1,36 @@
 """
-Dataset module for loading and preprocessing video clips from multiple
-surveillance / action-recognition datasets into a unified format for SlowFast.
+Dataset module for loading and preprocessing video clips into SlowFast format.
 
-Supported dataset structures
+Expected directory structure
 ─────────────────────────────
-1. Folder-based (RWF-2000, UR-Fall):
-       root_dir/
-         train/
-           ClassName1/  video1.avi  video2.avi ...
-           ClassName2/  ...
-         val/
-           ClassName1/  ...
+    data/
+      train/
+        normal/     video1.avi  video2.mp4 ...
+        fight/      ...
+        vandalism/  ...
+        faint/      ...
+      test/
+        normal/     ...
+        fight/      ...
+        vandalism/  ...
+        faint/      ...
 
-2. Annotation-file-based (UCF-Crime, XD-Violence):
-       root_dir/
-         videos/       video1.mp4  video2.mp4 ...
-         annotations/  train.txt   test.txt
-       Each line in the annotation file:  <video_path> <label>
+Classes are auto-discovered from the folder names in data/train/.
+You can train with 2, 3, or 4+ classes — just include the folders you need.
 """
 
 import os
 import random
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Callable
+from typing import List, Tuple, Optional, Callable
 
 import av
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms as T
 
 from configs.config import (
-    DatasetConfig, TrainConfig, ACTION_CLASSES, CLASS_TO_IDX, NUM_CLASSES
+    TrainConfig, ACTION_CLASSES, CLASS_TO_IDX, NUM_CLASSES,
 )
 
 
@@ -48,14 +47,12 @@ def decode_video_pyav(video_path: str, num_frames: int, fps: Optional[float] = N
     stream = container.streams.video[0]
     total_frames = stream.frames
     if total_frames == 0:
-        # Estimate from duration
         duration = float(stream.duration * stream.time_base)
         avg_fps = float(stream.average_rate) if stream.average_rate else 25.0
         total_frames = int(duration * avg_fps)
 
     total_frames = max(total_frames, num_frames)
 
-    # Compute indices to sample uniformly
     indices = np.linspace(0, total_frames - 1, num_frames, dtype=np.int64)
     indices_set = set(indices.tolist())
 
@@ -71,7 +68,6 @@ def decode_video_pyav(video_path: str, num_frames: int, fps: Optional[float] = N
 
     container.close()
 
-    # If we got fewer frames than needed (short video), duplicate last frame
     while len(frames) < num_frames:
         frames.append(frames[-1] if frames else np.zeros((224, 224, 3), dtype=np.uint8))
 
@@ -91,21 +87,19 @@ def pack_frames_slowfast(
 ) -> List[torch.Tensor]:
     """
     Given T frames (T, H, W, 3), produce the two-pathway input for SlowFast:
-      - slow_pathway: (1, 3, num_frames_slow, crop_size, crop_size)
-      - fast_pathway: (1, 3, num_frames_fast, crop_size, crop_size)
+      - slow_pathway: (3, num_frames_slow, crop_size, crop_size)
+      - fast_pathway: (3, num_frames_fast, crop_size, crop_size)
 
-    Returns [slow_tensor, fast_tensor] each of shape (3, T, H, W).
+    Returns [slow_tensor, fast_tensor].
     """
     T_total = frames.shape[0]
 
-    # --- Sample slow & fast indices ---
     slow_indices = np.linspace(0, T_total - 1, num_frames_slow, dtype=np.int64)
     fast_indices = np.linspace(0, T_total - 1, num_frames_fast, dtype=np.int64)
 
-    slow_frames = frames[slow_indices]  # (Ts, H, W, 3)
-    fast_frames = frames[fast_indices]  # (Tf, H, W, 3)
+    slow_frames = frames[slow_indices]
+    fast_frames = frames[fast_indices]
 
-    # --- Apply spatial transforms (resize + crop + normalize) ---
     slow_tensor = _frames_to_tensor(slow_frames, crop_size, spatial_transform)
     fast_tensor = _frames_to_tensor(fast_frames, crop_size, spatial_transform)
 
@@ -118,17 +112,15 @@ def _frames_to_tensor(
     spatial_transform: Optional[Callable] = None,
 ) -> torch.Tensor:
     """Convert (T, H, W, 3) uint8 → (3, T, crop_size, crop_size) float tensor."""
-    num_t, H, W, C = frames.shape
+    num_t = frames.shape[0]
 
-    # Resize shortest side to crop_size, then center-crop
     tensors = []
     for t in range(num_t):
-        img = torch.from_numpy(frames[t]).permute(2, 0, 1).float() / 255.0  # (3,H,W)
-        # Resize
+        img = torch.from_numpy(frames[t]).permute(2, 0, 1).float() / 255.0
         img = T.functional.resize(img, [crop_size, crop_size], antialias=True)
         tensors.append(img)
 
-    tensor = torch.stack(tensors, dim=1)  # (3, num_t, H, W)
+    tensor = torch.stack(tensors, dim=1)  # (3, T, H, W)
 
     if spatial_transform is not None:
         tensor = spatial_transform(tensor)
@@ -156,15 +148,12 @@ class SpatialAugmentation:
         self.cfg = cfg
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        # tensor shape: (3, T, H, W)
         if not self.is_train:
             return tensor
 
-        # Random horizontal flip (applied to all frames consistently)
         if random.random() < self.cfg.horizontal_flip_prob:
             tensor = torch.flip(tensor, dims=[-1])
 
-        # Random color jitter (applied frame-by-frame but with same params)
         if self.cfg.color_jitter > 0:
             jitter = self.cfg.color_jitter
             brightness = 1.0 + random.uniform(-jitter, jitter)
@@ -182,85 +171,61 @@ class SpatialAugmentation:
 
 class ActionVideoDataset(Dataset):
     """
-    Unified dataset that loads video clips and returns SlowFast input pairs.
+    Folder-based video dataset for SlowFast.
 
-    Supports two modes of discovering videos:
-    1. Folder-based: root_dir/{split}/{class_name}/video.ext
-    2. Annotation-based: reads an annotation .txt file with lines
-       "relative/path/to/video.ext <label_string>"
+    Expects:
+        data_root/{split}/{class_name}/video.ext
+
+    Classes are mapped using the global CLASS_TO_IDX dictionary,
+    which is auto-discovered from data_root/train/ at import time.
     """
 
     def __init__(
         self,
-        dataset_cfg: DatasetConfig,
+        data_root: str,
         train_cfg: TrainConfig,
         split: str = "train",
         is_train: bool = True,
-        annotation_file: Optional[str] = None,
     ):
         super().__init__()
-        self.dataset_cfg = dataset_cfg
         self.train_cfg = train_cfg
         self.is_train = is_train
         self.spatial_aug = SpatialAugmentation(train_cfg, is_train)
-
-        # Total frames to decode (enough for both pathways)
         self.num_frames_decode = max(train_cfg.num_frames_fast, train_cfg.num_frames_slow * 4)
 
-        # Build list of (video_path, label_idx)
         self.samples: List[Tuple[str, int]] = []
+        self._load_from_folders(data_root, split, train_cfg.video_extensions)
 
-        if annotation_file and os.path.isfile(annotation_file):
-            self._load_from_annotation(annotation_file)
-        else:
-            self._load_from_folders(split)
+        print(f"[{split}] Loaded {len(self.samples)} clips ({self._class_distribution()})")
 
-        print(f"[{dataset_cfg.name}/{split}] Loaded {len(self.samples)} clips "
-              f"({self._class_distribution()})")
-
-    # ── discovery helpers ──
-
-    def _load_from_folders(self, split: str):
-        """Folder-based: root_dir/{split}/{class_name}/video.ext"""
-        split_dir = os.path.join(self.dataset_cfg.root_dir, split)
+    def _load_from_folders(self, data_root: str, split: str, video_extensions: Tuple[str, ...]):
+        """Scan data_root/{split}/{class_name}/ for video files."""
+        split_dir = os.path.join(data_root, split)
         if not os.path.isdir(split_dir):
-            # Try without split subfolder (flat structure)
-            split_dir = self.dataset_cfg.root_dir
+            print(f"⚠ Split directory not found: {split_dir}")
+            return
 
-        for class_name, label_idx in self.dataset_cfg.label_map.items():
+        for class_name in sorted(os.listdir(split_dir)):
             class_dir = os.path.join(split_dir, class_name)
-            if not os.path.isdir(class_dir):
+            if not os.path.isdir(class_dir) or class_name.startswith("."):
                 continue
+
+            if class_name not in CLASS_TO_IDX:
+                print(f"⚠ Folder '{class_name}' in {split_dir} not in CLASS_TO_IDX — skipping. "
+                      f"Known classes: {list(CLASS_TO_IDX.keys())}")
+                continue
+
+            label_idx = CLASS_TO_IDX[class_name]
             for fname in sorted(os.listdir(class_dir)):
-                if fname.lower().endswith(self.dataset_cfg.video_ext):
+                if fname.lower().endswith(video_extensions):
                     fpath = os.path.join(class_dir, fname)
                     self.samples.append((fpath, label_idx))
-
-    def _load_from_annotation(self, annotation_file: str):
-        """Annotation-file-based: each line → 'rel_path label_string'"""
-        root = self.dataset_cfg.root_dir
-        with open(annotation_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.rsplit(maxsplit=1)
-                if len(parts) != 2:
-                    continue
-                rel_path, label_str = parts
-                if label_str in self.dataset_cfg.label_map:
-                    label_idx = self.dataset_cfg.label_map[label_str]
-                    video_path = os.path.join(root, rel_path)
-                    if os.path.isfile(video_path):
-                        self.samples.append((video_path, label_idx))
 
     def _class_distribution(self) -> str:
         from collections import Counter
         counts = Counter(label for _, label in self.samples)
         parts = [f"{ACTION_CLASSES[k]}:{v}" for k, v in sorted(counts.items())]
         return ", ".join(parts)
-
-    # ── __getitem__ ──
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -288,106 +253,52 @@ class ActionVideoDataset(Dataset):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Build combined DataLoaders
+#  Build DataLoaders
 # ══════════════════════════════════════════════════════════════════════
 
-def build_datasets(
-    dataset_configs: List[DatasetConfig],
-    train_cfg: TrainConfig,
-) -> Tuple[Dataset, Dataset]:
-    """
-    Build combined train and val datasets from all configured sources.
-    If datasets don't have explicit val splits, we create a random split.
-    """
-    train_datasets = []
-    val_datasets = []
-
-    for dcfg in dataset_configs:
-        if not os.path.isdir(dcfg.root_dir):
-            print(f"⚠ Dataset directory not found: {dcfg.root_dir} — skipping {dcfg.name}")
-            continue
-
-        # Check if train/val split folders exist
-        has_split_folders = (
-            os.path.isdir(os.path.join(dcfg.root_dir, "train")) and
-            os.path.isdir(os.path.join(dcfg.root_dir, "val"))
-        )
-
-        if has_split_folders:
-            train_ds = ActionVideoDataset(dcfg, train_cfg, split="train", is_train=True)
-            val_ds = ActionVideoDataset(dcfg, train_cfg, split="val", is_train=False)
-        else:
-            # Create a single dataset and we'll split later
-            full_ds = ActionVideoDataset(dcfg, train_cfg, split="train", is_train=True)
-            n_val = int(len(full_ds) * train_cfg.val_split)
-            n_train = len(full_ds) - n_val
-            train_ds, val_ds = torch.utils.data.random_split(full_ds, [n_train, n_val])
-
-        train_datasets.append(train_ds)
-        val_datasets.append(val_ds)
-
-    if not train_datasets:
-        raise RuntimeError("No datasets were loaded! Check your data paths in configs/config.py")
-
-    combined_train = ConcatDataset(train_datasets)
-    combined_val = ConcatDataset(val_datasets)
-
-    print(f"\n{'='*60}")
-    print(f"Combined: {len(combined_train)} train clips, {len(combined_val)} val clips")
-    print(f"{'='*60}\n")
-
-    return combined_train, combined_val
-
-
 def build_dataloaders(
-    dataset_configs: List[DatasetConfig],
     train_cfg: TrainConfig,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Build DataLoaders with optional class-weighted sampling."""
-    train_dataset, val_dataset = build_datasets(dataset_configs, train_cfg)
+    """
+    Build train and val/test DataLoaders.
+
+    Looks for data_root/train/ and data_root/test/.
+    If test/ doesn't exist, splits train/ using train_cfg.val_split.
+    """
+    data_root = train_cfg.data_root
+
+    train_dataset = ActionVideoDataset(data_root, train_cfg, split="train", is_train=True)
+
+    # Use test/ as the validation set
+    test_dir = os.path.join(data_root, "test")
+    if os.path.isdir(test_dir):
+        val_dataset = ActionVideoDataset(data_root, train_cfg, split="test", is_train=False)
+    else:
+        # Fall back to a random split of train
+        n_val = int(len(train_dataset) * train_cfg.val_split)
+        n_train = len(train_dataset) - n_val
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [n_train, n_val]
+        )
+        print(f"⚠ No test/ folder found — split train into {n_train} train + {n_val} val")
+
+    print(f"\n{'='*60}")
+    print(f"Dataset: {len(train_dataset)} train clips, {len(val_dataset)} val/test clips")
+    print(f"Classes: {ACTION_CLASSES} ({NUM_CLASSES} classes)")
+    print(f"{'='*60}\n")
 
     # --- Weighted sampler for class imbalance ---
     sampler = None
     shuffle = True
     if train_cfg.use_class_weights:
-        labels = []
-        for i in range(len(train_dataset)):
-            # ConcatDataset: access underlying dataset
-            ds = train_dataset
-            if hasattr(ds, "datasets"):
-                # Walk through ConcatDataset to get the label
-                cumulative = 0
-                for sub_ds in ds.datasets:
-                    if i < cumulative + len(sub_ds):
-                        local_idx = i - cumulative
-                        if hasattr(sub_ds, "samples"):
-                            _, lbl = sub_ds.samples[local_idx]
-                        elif hasattr(sub_ds, "dataset"):
-                            # random_split subset
-                            real_idx = sub_ds.indices[local_idx]
-                            _, lbl = sub_ds.dataset.samples[real_idx]
-                        else:
-                            lbl = 0
-                        labels.append(lbl)
-                        break
-                    cumulative += len(sub_ds)
-            else:
-                _, lbl = ds[i]
-                labels.append(lbl.item() if isinstance(lbl, torch.Tensor) else lbl)
-
-        class_counts = np.bincount(labels, minlength=NUM_CLASSES).astype(float)
-        class_counts = np.maximum(class_counts, 1.0)  # avoid division by zero
-        weights_per_class = 1.0 / class_counts
-        sample_weights = [weights_per_class[l] for l in labels]
-        sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
-        shuffle = False
-
-    def slowfast_collate(batch):
-        """Custom collate: batch list of ([slow, fast], label)."""
-        slow_clips = torch.stack([item[0][0] for item in batch])
-        fast_clips = torch.stack([item[0][1] for item in batch])
-        labels = torch.stack([item[1] for item in batch])
-        return [slow_clips, fast_clips], labels
+        labels = _extract_labels(train_dataset)
+        if labels is not None:
+            class_counts = np.bincount(labels, minlength=NUM_CLASSES).astype(float)
+            class_counts = np.maximum(class_counts, 1.0)
+            weights_per_class = 1.0 / class_counts
+            sample_weights = [weights_per_class[l] for l in labels]
+            sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+            shuffle = False
 
     train_loader = DataLoader(
         train_dataset,
@@ -410,3 +321,30 @@ def build_dataloaders(
     )
 
     return train_loader, val_loader
+
+
+def _extract_labels(dataset) -> Optional[np.ndarray]:
+    """Extract all labels from a dataset (handles Subset and ActionVideoDataset)."""
+    labels = []
+    try:
+        if hasattr(dataset, "samples"):
+            # ActionVideoDataset
+            labels = [lbl for _, lbl in dataset.samples]
+        elif hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+            # torch Subset from random_split
+            for idx in dataset.indices:
+                _, lbl = dataset.dataset.samples[idx]
+                labels.append(lbl)
+        else:
+            return None
+    except Exception:
+        return None
+    return np.array(labels)
+
+
+def slowfast_collate(batch):
+    """Custom collate: batch list of ([slow, fast], label)."""
+    slow_clips = torch.stack([item[0][0] for item in batch])
+    fast_clips = torch.stack([item[0][1] for item in batch])
+    labels = torch.stack([item[1] for item in batch])
+    return [slow_clips, fast_clips], labels

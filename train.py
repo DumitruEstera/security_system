@@ -1,10 +1,11 @@
 """
-train.py — Fine-tune a SlowFast-R50 model on security surveillance datasets.
+train.py — Fine-tune a SlowFast-R50 model on a custom security surveillance dataset.
 
 Usage:
     python train.py                          # Train with default config
     python train.py --epochs 50 --batch_size 4 --lr 5e-4
     python train.py --resume output/checkpoints/last_model.pth
+    python train.py --data_root ./data       # Custom data directory
 
 The training strategy:
   1. Freeze backbone, train only the new head for N warmup epochs.
@@ -12,13 +13,26 @@ The training strategy:
      backbone and a higher LR for the head.
   3. Use class-weighted sampling to handle dataset imbalance.
   4. Early stopping based on validation macro-F1.
+
+Expected data structure:
+    data/
+      train/
+        normal/   *.avi / *.mp4
+        fight/    ...
+        ...
+      test/
+        normal/   ...
+        fight/    ...
+        ...
+
+Classes are auto-discovered from the folder names in data/train/.
+You can train with 2, 3, or more classes — just have the corresponding folders.
 """
 
 import os
 import sys
 import argparse
 import time
-from datetime import datetime
 
 import numpy as np
 import torch
@@ -30,8 +44,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from configs.config import (
-    ModelConfig, TrainConfig, DATASET_CONFIGS,
-    ACTION_CLASSES, NUM_CLASSES,
+    ModelConfig, TrainConfig, ACTION_CLASSES, NUM_CLASSES, refresh_classes,
 )
 from data.dataset import build_dataloaders
 from models.slowfast_model import SlowFastSecurityModel
@@ -50,6 +63,8 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Path to data directory (default: ./data)")
     parser.add_argument("--freeze_epochs", type=int, default=None,
                         help="Number of epochs to freeze backbone")
     return parser.parse_args()
@@ -135,6 +150,10 @@ def main():
     train_cfg = TrainConfig()
 
     # Override config with CLI args
+    if args.data_root:
+        train_cfg.data_root = args.data_root
+        # Re-discover classes from the new data root
+        refresh_classes(args.data_root)
     if args.epochs:
         train_cfg.epochs = args.epochs
     if args.batch_size:
@@ -148,11 +167,16 @@ def main():
     if args.freeze_epochs is not None:
         model_cfg.freeze_backbone_epochs = args.freeze_epochs
 
+    # Update num_classes from (possibly refreshed) global
+    from configs.config import ACTION_CLASSES as CURRENT_CLASSES, NUM_CLASSES as CURRENT_NUM
+    model_cfg.num_classes = CURRENT_NUM
+
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥  Device: {device}")
-    print(f"📋 Classes: {ACTION_CLASSES}")
+    print(f"📋 Classes ({CURRENT_NUM}): {CURRENT_CLASSES}")
     print(f"📋 Config: {train_cfg.epochs} epochs, batch={train_cfg.batch_size}, "
           f"lr={train_cfg.learning_rate}")
+    print(f"📂 Data root: {train_cfg.data_root}")
 
     # ── Create output directories ──
     os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
@@ -160,7 +184,7 @@ def main():
 
     # ── Build data loaders ──
     print("\n📂 Loading datasets...")
-    train_loader, val_loader = build_dataloaders(DATASET_CONFIGS, train_cfg)
+    train_loader, val_loader = build_dataloaders(train_cfg)
 
     # ── Build model ──
     print("\n🏗  Building SlowFast model...")
@@ -219,7 +243,6 @@ def main():
             val_losses.append(val_loss)
             val_f1s.append(metrics["macro_f1"])
 
-            # Save if best
             if metrics["macro_f1"] > best_f1:
                 best_f1 = metrics["macro_f1"]
                 save_checkpoint(
@@ -242,7 +265,6 @@ def main():
     print(f"{'='*60}")
     model.unfreeze_backbone()
 
-    # Differential LR: backbone gets 10× lower LR
     param_groups = model.get_optimizer_param_groups(
         lr=train_cfg.learning_rate, lr_backbone_factor=0.1
     )
@@ -273,7 +295,6 @@ def main():
         val_losses.append(val_loss)
         val_f1s.append(metrics["macro_f1"])
 
-        # Save best
         if metrics["macro_f1"] > best_f1:
             best_f1 = metrics["macro_f1"]
             save_checkpoint(
@@ -281,13 +302,11 @@ def main():
                 os.path.join(train_cfg.checkpoint_dir, "best_model.pth"),
             )
 
-        # Save last
         save_checkpoint(
             model, optimizer, epoch, metrics,
             os.path.join(train_cfg.checkpoint_dir, "last_model.pth"),
         )
 
-        # Early stopping
         if early_stopping(metrics["macro_f1"]):
             break
 
@@ -298,7 +317,6 @@ def main():
     print(f"  Training complete! Best macro F1: {best_f1:.4f}")
     print(f"{'='*60}")
 
-    # Load best model for final evaluation
     from models.slowfast_model import load_model_for_inference
     best_model = load_model_for_inference(
         os.path.join(train_cfg.checkpoint_dir, "best_model.pth"),
@@ -310,7 +328,6 @@ def main():
     final_metrics = compute_metrics(final_labels, final_preds)
     print_metrics(final_metrics)
 
-    # Plots
     plot_confusion_matrix(
         final_labels, final_preds,
         save_path=os.path.join(train_cfg.output_dir, "confusion_matrix.png"),

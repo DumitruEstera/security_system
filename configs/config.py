@@ -24,7 +24,6 @@ DEFAULT_ACTION_CLASSES = [
     "normal",       # 0
     "fight",        # 1
     "vandalism",    # 2
-    "faint",        # 3
 ]
 
 
